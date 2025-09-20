@@ -102,13 +102,17 @@ func (p *AvitoParser) generatePageURL(pageNum int) string {
 	return parsedURL.String()
 }
 
-// hasListings checks if page has listings (minimum threshold)
+// hasListings checks if page has listings (minimum threshold) with nil safety
 func (p *AvitoParser) hasListings(pageURL string) (bool, int, error) {
 	page, err := p.browser.Page(proto.TargetCreateTarget{URL: pageURL})
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to create page: %w", err)
 	}
-	defer page.Close()
+	defer func() {
+		if page != nil {
+			page.Close()
+		}
+	}()
 
 	// Wait for page to load
 	err = page.WaitLoad()
@@ -119,36 +123,67 @@ func (p *AvitoParser) hasListings(pageURL string) (bool, int, error) {
 	// Wait a bit for dynamic content
 	time.Sleep(2 * time.Second)
 
-	// Try to find listings
-	listingElements, err := page.Elements("[data-marker='item']")
-	if err != nil || len(listingElements) == 0 {
-		// Try alternative selector
-		listingElements, err = page.Elements("[data-marker*='item']")
-		if err != nil {
-			return false, 0, nil
+	// Try to find listings with multiple selectors
+	selectors := []string{
+		"[data-marker='item']",
+		"[data-marker*='item']",
+		".item, .listing-item",
+	}
+
+	var listingElements rod.Elements
+	for _, selector := range selectors {
+		listingElements, err = page.Elements(selector)
+		if err == nil && len(listingElements) > 0 {
+			break
 		}
 	}
 	
-	count := len(listingElements)
-	return count >= 3, count, nil // Consider page valid if it has at least 3 listings
+	if err != nil {
+		log.Printf("Error finding listings on page: %v", err)
+		return false, 0, nil
+	}
+	
+	// Count valid (non-nil) elements
+	validCount := 0
+	for _, element := range listingElements {
+		if element != nil {
+			validCount++
+		}
+	}
+	
+	log.Printf("Found %d valid listings on page", validCount)
+	return validCount >= 3, validCount, nil // Consider page valid if it has at least 3 listings
 }
 
-// ParseAllPages parses all available pages starting from page 1
+// ParseAllPages parses all available pages starting from page 1 with improved error handling
 func (p *AvitoParser) ParseAllPages() error {
 	log.Println("Starting full parsing cycle...")
 	
 	totalNewListings := 0
 	totalPages := 0
 	currentPage := 1
+	maxRetries := 3
 	
 	for {
 		pageURL := p.generatePageURL(currentPage)
 		log.Printf("Processing page %d...", currentPage)
 		
-		// Check if page has enough listings
-		hasListings, listingCount, err := p.hasListings(pageURL)
+		// Check if page has enough listings with retry
+		var hasListings bool
+		var listingCount int
+		var err error
+		
+		for retry := 0; retry < maxRetries; retry++ {
+			hasListings, listingCount, err = p.hasListings(pageURL)
+			if err == nil {
+				break
+			}
+			log.Printf("Retry %d for page %d: %v", retry+1, currentPage, err)
+			time.Sleep(2 * time.Second)
+		}
+		
 		if err != nil {
-			log.Printf("Error checking page %d: %v, skipping...", currentPage, err)
+			log.Printf("Failed to check page %d after %d retries: %v, skipping...", currentPage, maxRetries, err)
 			currentPage++
 			if currentPage > 10 { // Safety limit
 				break
@@ -161,10 +196,19 @@ func (p *AvitoParser) ParseAllPages() error {
 			break
 		}
 		
-		// Parse the page
-		listings, err := p.ParseListings(pageURL)
+		// Parse the page with retry
+		var listings []*models.Listing
+		for retry := 0; retry < maxRetries; retry++ {
+			listings, err = p.ParseListings(pageURL)
+			if err == nil {
+				break
+			}
+			log.Printf("Retry %d parsing page %d: %v", retry+1, currentPage, err)
+			time.Sleep(2 * time.Second)
+		}
+		
 		if err != nil {
-			log.Printf("Error parsing page %d: %v, skipping...", currentPage, err)
+			log.Printf("Failed to parse page %d after %d retries: %v, skipping...", currentPage, maxRetries, err)
 			currentPage++
 			continue
 		}
@@ -172,14 +216,17 @@ func (p *AvitoParser) ParseAllPages() error {
 		// Save listings
 		newListingsCount := 0
 		for _, listing := range listings {
+			if listing == nil {
+				continue // Skip nil listings
+			}
+			
 			err := p.SaveListing(listing)
 			if err != nil {
-				log.Printf("Error saving listing: %v", err)
-			} else {
-				// Check if it was actually saved (not a duplicate)
 				if !strings.Contains(err.Error(), "already exists") {
-					newListingsCount++
+					log.Printf("Error saving listing: %v", err)
 				}
+			} else {
+				newListingsCount++
 			}
 		}
 		
@@ -208,23 +255,35 @@ func (p *AvitoParser) ParseAllPages() error {
 // StartContinuousParsing starts continuous parsing with cycles
 func (p *AvitoParser) StartContinuousParsing() {
 	for {
-		err := p.ParseAllPages()
-		if err != nil {
-			log.Printf("Error during parsing cycle: %v", err)
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic in parsing cycle: %v", r)
+				}
+			}()
+			
+			err := p.ParseAllPages()
+			if err != nil {
+				log.Printf("Error during parsing cycle: %v", err)
+			}
+		}()
 		
 		log.Printf("Waiting %v before next cycle...", p.cycleDelay)
 		time.Sleep(p.cycleDelay)
 	}
 }
 
-// ParseListings parses apartment listings from the given URL
+// ParseListings parses apartment listings from the given URL with nil safety
 func (p *AvitoParser) ParseListings(url string) ([]*models.Listing, error) {
 	page, err := p.browser.Page(proto.TargetCreateTarget{URL: url})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create page: %w", err)
 	}
-	defer page.Close()
+	defer func() {
+		if page != nil {
+			page.Close()
+		}
+	}()
 
 	// Wait for page to load
 	err = page.WaitLoad()
@@ -235,31 +294,35 @@ func (p *AvitoParser) ParseListings(url string) ([]*models.Listing, error) {
 	// Wait a bit more for dynamic content
 	time.Sleep(3 * time.Second)
 
-	// Wait for listings to appear
-	err = page.Timeout(p.timeout).WaitElementsMoreThan("[data-marker='item']", 0)
-	if err != nil {
-		log.Printf("Warning: No listings found with primary selector, trying alternative: %v", err)
-		// Try alternative selector
-		err = page.Timeout(p.timeout).WaitElementsMoreThan("[data-marker*='item']", 0)
-		if err != nil {
-			log.Printf("Warning: No listings found with any selector: %v", err)
-			return []*models.Listing{}, nil
+	// Try multiple selectors to find listings
+	selectors := []string{
+		"[data-marker='item']",
+		"[data-marker*='item']",
+		".item, .listing-item",
+	}
+
+	var listingElements rod.Elements
+	for _, selector := range selectors {
+		listingElements, err = page.Elements(selector)
+		if err == nil && len(listingElements) > 0 {
+			log.Printf("Found %d elements with selector: %s", len(listingElements), selector)
+			break
 		}
 	}
 
-	// Find all listing elements
-	listingElements, err := page.Elements("[data-marker='item']")
 	if err != nil || len(listingElements) == 0 {
-		// Try alternative selector
-		listingElements, err = page.Elements("[data-marker*='item']")
-		if err != nil {
-			return nil, fmt.Errorf("failed to find listing elements: %w", err)
-		}
+		log.Printf("No listing elements found on page")
+		return []*models.Listing{}, nil
 	}
 
 	var listings []*models.Listing
 
 	for i, element := range listingElements {
+		if element == nil {
+			log.Printf("Skipping nil element at index %d", i)
+			continue
+		}
+		
 		listing, err := p.parseListingElement(element)
 		if err != nil {
 			log.Printf("Failed to parse listing %d: %v", i, err)
@@ -271,61 +334,69 @@ func (p *AvitoParser) ParseListings(url string) ([]*models.Listing, error) {
 		}
 	}
 
+	log.Printf("Successfully parsed %d valid listings from %d elements", len(listings), len(listingElements))
 	return listings, nil
 }
 
-// parseListingElement extracts data from a single listing element
+// parseListingElement extracts data from a single listing element with nil safety
 func (p *AvitoParser) parseListingElement(element *rod.Element) (*models.Listing, error) {
-	// Extract title
-	titleElement, err := element.Element("[itemprop='name']")
+	if element == nil {
+		return nil, fmt.Errorf("element is nil")
+	}
+
+	// Extract title with multiple selectors and nil checks
+	titleSelectors := []string{
+		"[itemprop='name']",
+		"[data-marker='item-title'] a",
+		"h3 a",
+		".item-title a",
+		"[data-marker*='title'] a",
+		"a[title]",
+	}
+
 	var title string
-	if err != nil {
-		// Try alternative selectors
-		titleElement, err = element.Element("[data-marker='item-title'] a")
-		if err != nil {
-			titleElement, err = element.Element("h3 a, .item-title a, [data-marker*='title'] a")
-			if err != nil {
-				return nil, fmt.Errorf("title not found")
+	for _, selector := range titleSelectors {
+		titleElement, err := element.Element(selector)
+		if err == nil && titleElement != nil {
+			title, err = titleElement.Text()
+			if err == nil && strings.TrimSpace(title) != "" {
+				title = strings.TrimSpace(title)
+				break
 			}
 		}
 	}
-	title, err = titleElement.Text()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get title text: %w", err)
-	}
-	title = strings.TrimSpace(title)
 
-	// Extract price
-	priceElement, err := element.Element("[itemprop='price'], [data-marker='item-price']")
-	var price string
-	if err != nil {
-		// Try alternative price selectors
-		priceElement, err = element.Element(".price, [data-marker*='price'], .item-price")
-		if err != nil {
-			price = "Price not specified"
-		} else {
-			price, err = priceElement.Text()
-			if err != nil {
-				price = "Price not available"
-			} else {
-				price = strings.TrimSpace(price)
+	if title == "" {
+		return nil, fmt.Errorf("title not found or empty")
+	}
+
+	// Extract price with multiple selectors and nil checks
+	priceSelectors := []string{
+		"[itemprop='price']",
+		"[data-marker='item-price']",
+		".price",
+		"[data-marker*='price']",
+		".item-price",
+	}
+
+	var price string = "Price not specified"
+	for _, selector := range priceSelectors {
+		priceElement, err := element.Element(selector)
+		if err == nil && priceElement != nil {
+			priceText, err := priceElement.Text()
+			if err == nil && strings.TrimSpace(priceText) != "" {
+				price = strings.TrimSpace(priceText)
+				break
 			}
 		}
-	} else {
-		price, err = priceElement.Text()
-		if err != nil {
-			price = "Price not available"
-		} else {
-			price = strings.TrimSpace(price)
-		}
 	}
 
-	// Extract URL
-	linkElement, err := element.Element("a[href]")
+	// Extract URL with nil checks
 	var itemURL string
-	if err == nil {
+	linkElement, err := element.Element("a[href]")
+	if err == nil && linkElement != nil {
 		href, err := linkElement.Attribute("href")
-		if err == nil && href != nil {
+		if err == nil && href != nil && *href != "" {
 			itemURL = *href
 			if !strings.HasPrefix(itemURL, "http") {
 				itemURL = "https://www.avito.ru" + itemURL
@@ -337,6 +408,9 @@ func (p *AvitoParser) parseListingElement(element *rod.Element) (*models.Listing
 	id := fmt.Sprintf("listing_%d", time.Now().UnixNano())
 	if itemURL != "" {
 		id = fmt.Sprintf("listing_%s", strings.ReplaceAll(itemURL, "/", "_"))
+	} else {
+		// Use title hash as fallback
+		id = fmt.Sprintf("listing_title_%d", len(title))
 	}
 
 	listing := &models.Listing{
@@ -351,8 +425,16 @@ func (p *AvitoParser) parseListingElement(element *rod.Element) (*models.Listing
 	return listing, nil
 }
 
-// SaveListing saves a listing to Redis
+// SaveListing saves a listing to Redis with improved error handling
 func (p *AvitoParser) SaveListing(listing *models.Listing) error {
+	if listing == nil {
+		return fmt.Errorf("listing is nil")
+	}
+
+	if listing.ID == "" {
+		return fmt.Errorf("listing ID is empty")
+	}
+
 	// Check if listing already exists
 	exists, err := p.db.Exists(listing.ID)
 	if err != nil {
