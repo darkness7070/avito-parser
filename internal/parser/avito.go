@@ -3,6 +3,7 @@ package parser
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -33,11 +34,29 @@ func NewAvitoParser(db *database.RedisClient, headless bool, timeout time.Durati
 // Start initializes the browser
 func (p *AvitoParser) Start() error {
 	var l *launcher.Launcher
-	if p.headless {
-		l = launcher.New().Headless(true).NoSandbox(true)
+	
+	// Check if we have a custom browser path
+	browserPath := os.Getenv("ROD_LAUNCHER_BIN")
+	if browserPath != "" {
+		l = launcher.New().Bin(browserPath)
 	} else {
-		l = launcher.New().Headless(false)
+		l = launcher.New()
 	}
+	
+	if p.headless {
+		l = l.Headless(true).NoSandbox(true)
+	} else {
+		l = l.Headless(false)
+	}
+	
+	// Add additional Chrome flags for better compatibility in containers
+	l = l.Set("disable-gpu").
+		Set("disable-dev-shm-usage").
+		Set("disable-extensions").
+		Set("no-first-run").
+		Set("disable-background-timer-throttling").
+		Set("disable-backgrounding-occluded-windows").
+		Set("disable-renderer-backgrounding")
 
 	url, err := l.Launch()
 	if err != nil {
@@ -68,17 +87,29 @@ func (p *AvitoParser) ParseListings(url string) ([]*models.Listing, error) {
 		return nil, fmt.Errorf("failed to wait for page load: %w", err)
 	}
 
+	// Wait a bit more for dynamic content
+	time.Sleep(3 * time.Second)
+
 	// Wait for listings to appear
 	err = page.Timeout(p.timeout).WaitElementsMoreThan("[data-marker='item']", 0)
 	if err != nil {
-		log.Printf("Warning: No listings found on page: %v", err)
-		return []*models.Listing{}, nil
+		log.Printf("Warning: No listings found with primary selector, trying alternative: %v", err)
+		// Try alternative selector
+		err = page.Timeout(p.timeout).WaitElementsMoreThan("[data-marker*='item']", 0)
+		if err != nil {
+			log.Printf("Warning: No listings found with any selector: %v", err)
+			return []*models.Listing{}, nil
+		}
 	}
 
 	// Find all listing elements
 	listingElements, err := page.Elements("[data-marker='item']")
-	if err != nil {
-		return nil, fmt.Errorf("failed to find listing elements: %w", err)
+	if err != nil || len(listingElements) == 0 {
+		// Try alternative selector
+		listingElements, err = page.Elements("[data-marker*='item']")
+		if err != nil {
+			return nil, fmt.Errorf("failed to find listing elements: %w", err)
+		}
 	}
 
 	var listings []*models.Listing
@@ -105,10 +136,13 @@ func (p *AvitoParser) parseListingElement(element *rod.Element) (*models.Listing
 	titleElement, err := element.Element("[itemprop='name']")
 	var title string
 	if err != nil {
-		// Try alternative selector
+		// Try alternative selectors
 		titleElement, err = element.Element("[data-marker='item-title'] a")
 		if err != nil {
-			return nil, fmt.Errorf("title not found")
+			titleElement, err = element.Element("h3 a, .item-title a, [data-marker*='title'] a")
+			if err != nil {
+				return nil, fmt.Errorf("title not found")
+			}
 		}
 	}
 	title, err = titleElement.Text()
@@ -121,7 +155,18 @@ func (p *AvitoParser) parseListingElement(element *rod.Element) (*models.Listing
 	priceElement, err := element.Element("[itemprop='price'], [data-marker='item-price']")
 	var price string
 	if err != nil {
-		price = "Price not specified"
+		// Try alternative price selectors
+		priceElement, err = element.Element(".price, [data-marker*='price'], .item-price")
+		if err != nil {
+			price = "Price not specified"
+		} else {
+			price, err = priceElement.Text()
+			if err != nil {
+				price = "Price not available"
+			} else {
+				price = strings.TrimSpace(price)
+			}
+		}
 	} else {
 		price, err = priceElement.Text()
 		if err != nil {
