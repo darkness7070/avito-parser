@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"avito-parser/internal/config"
 	"avito-parser/internal/database"
@@ -31,11 +30,14 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	// Initialize Avito parser
+	// Initialize Avito parser with new parameters
 	avitoParser := parser.NewAvitoParser(
 		redisClient,
 		cfg.Browser.Headless,
 		cfg.Browser.Timeout,
+		cfg.Avito.BaseURL,
+		cfg.Parser.CycleDelay,
+		cfg.Parser.PageDelay,
 	)
 
 	// Start browser
@@ -49,43 +51,13 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start parsing in a separate goroutine
+	// Start continuous parsing in a separate goroutine
 	go func() {
-		// URL to parse (you can modify this or pass as argument)
-		url := "https://www.avito.ru/chelyabinsk/kvartiry/sdam/na_dlitelnyy_srok-ASgBAgICAkSSA8gQ8AeQUg?context=H4sIAAAAAAAA_wEjANz_YToxOntzOjg6ImZyb21QYWdlIjtzOjc6ImNhdGFsb2ciO312FITcIwAAAA&district=16"
-		
-		log.Println("Starting to parse Avito listings...")
-		
-		for {
-			select {
-			case <-sigChan:
-				log.Println("Received shutdown signal, stopping parser...")
-				return
-			default:
-				// Parse listings
-				listings, err := avitoParser.ParseListings(url)
-				if err != nil {
-					log.Printf("Error parsing listings: %v", err)
-				} else {
-					log.Printf("Found %d listings", len(listings))
-					
-					// Save each listing
-					for _, listing := range listings {
-						err := avitoParser.SaveListing(listing)
-						if err != nil {
-							log.Printf("Error saving listing: %v", err)
-						}
-					}
-				}
-				
-				// Wait before next parsing cycle
-				log.Printf("Waiting %v before next parsing cycle...", cfg.Parser.DelayBetweenRequests)
-				time.Sleep(cfg.Parser.DelayBetweenRequests)
-			}
-		}
+		log.Println("Starting continuous multi-page parsing...")
+		avitoParser.StartContinuousParsing()
 	}()
 
-	log.Println("Avito parser started. Press Ctrl+C to stop.")
+	log.Println("Avito multi-page parser started. Press Ctrl+C to stop.")
 	
 	// Wait for shutdown signal
 	<-sigChan
