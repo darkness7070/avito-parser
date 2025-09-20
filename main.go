@@ -47,6 +47,16 @@ func main() {
 	}
 	defer avitoParser.Close()
 
+	// Check if debug mode is enabled
+	if os.Getenv("DEBUG") == "true" {
+		log.Println("=== DEBUG MODE ENABLED ===")
+		err := avitoParser.DebugPage(cfg.Avito.BaseURL)
+		if err != nil {
+			log.Printf("Debug failed: %v", err)
+		}
+		return
+	}
+
 	// Set up graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -58,6 +68,7 @@ func main() {
 	}()
 
 	log.Println("Avito multi-page parser started. Press Ctrl+C to stop.")
+	log.Println("To enable debug mode, set DEBUG=true environment variable")
 	
 	// Wait for shutdown signal
 	<-sigChan
