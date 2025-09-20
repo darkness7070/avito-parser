@@ -1,8 +1,5 @@
 FROM golang:1.21-alpine AS builder
 
-# Install dependencies for Rod/Chromium
-RUN apk add --no-cache chromium
-
 WORKDIR /app
 
 # Copy go mod files
@@ -18,10 +15,18 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
 # Final stage
 FROM alpine:latest
 
-# Install chromium and ca-certificates
-RUN apk --no-cache add ca-certificates chromium
+# Install required packages for Chromium and Rod
+RUN apk --no-cache add \
+    chromium \
+    ca-certificates \
+    font-noto-emoji \
+    freetype \
+    harfbuzz \
+    ttf-freefont \
+    wqy-zenhei
 
-WORKDIR /root/
+# Create app directory
+WORKDIR /app
 
 # Copy the binary from builder
 COPY --from=builder /app/main .
@@ -29,7 +34,18 @@ COPY --from=builder /app/main .
 # Create logs directory
 RUN mkdir -p /app/logs
 
-# Set environment variable for Rod to use system Chromium
+# Create user to run chromium (chromium won't run as root)
+RUN addgroup -g 1001 -S appuser && \
+    adduser -u 1001 -S appuser -G appuser
+
+# Change ownership of app directory
+RUN chown -R appuser:appuser /app
+
+# Set environment variables for Rod
 ENV ROD_LAUNCHER_BIN=/usr/bin/chromium-browser
+ENV ROD_NO_SANDBOX=true
+
+# Switch to non-root user
+USER appuser
 
 CMD ["./main"]
