@@ -3,6 +3,7 @@ package parser
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -16,18 +17,24 @@ import (
 )
 
 type AvitoParser struct {
-	browser *rod.Browser
-	db      *database.RedisClient
-	headless bool
-	timeout  time.Duration
+	browser   *rod.Browser
+	db        *database.RedisClient
+	headless  bool
+	timeout   time.Duration
+	baseURL   string
+	cycleDelay time.Duration
+	pageDelay time.Duration
 }
 
 // NewAvitoParser creates a new Avito parser instance
-func NewAvitoParser(db *database.RedisClient, headless bool, timeout time.Duration) *AvitoParser {
+func NewAvitoParser(db *database.RedisClient, headless bool, timeout time.Duration, baseURL string, cycleDelay, pageDelay time.Duration) *AvitoParser {
 	return &AvitoParser{
-		db:      db,
-		headless: headless,
-		timeout: timeout,
+		db:        db,
+		headless:  headless,
+		timeout:   timeout,
+		baseURL:   baseURL,
+		cycleDelay: cycleDelay,
+		pageDelay: pageDelay,
 	}
 }
 
@@ -71,6 +78,144 @@ func (p *AvitoParser) Start() error {
 
 	log.Println("Browser started successfully")
 	return nil
+}
+
+// generatePageURL generates URL for a specific page number
+func (p *AvitoParser) generatePageURL(pageNum int) string {
+	if pageNum == 1 {
+		return p.baseURL
+	}
+	
+	// Parse the base URL
+	parsedURL, err := url.Parse(p.baseURL)
+	if err != nil {
+		log.Printf("Error parsing base URL: %v", err)
+		return p.baseURL
+	}
+	
+	// Add page parameter
+	query := parsedURL.Query()
+	query.Set("p", fmt.Sprintf("%d", pageNum))
+	query.Set("localPriority", "0")
+	parsedURL.RawQuery = query.Encode()
+	
+	return parsedURL.String()
+}
+
+// hasListings checks if page has listings (minimum threshold)
+func (p *AvitoParser) hasListings(pageURL string) (bool, int, error) {
+	page, err := p.browser.Page(proto.TargetCreateTarget{URL: pageURL})
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to create page: %w", err)
+	}
+	defer page.Close()
+
+	// Wait for page to load
+	err = page.WaitLoad()
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to wait for page load: %w", err)
+	}
+
+	// Wait a bit for dynamic content
+	time.Sleep(2 * time.Second)
+
+	// Try to find listings
+	listingElements, err := page.Elements("[data-marker='item']")
+	if err != nil || len(listingElements) == 0 {
+		// Try alternative selector
+		listingElements, err = page.Elements("[data-marker*='item']")
+		if err != nil {
+			return false, 0, nil
+		}
+	}
+	
+	count := len(listingElements)
+	return count >= 3, count, nil // Consider page valid if it has at least 3 listings
+}
+
+// ParseAllPages parses all available pages starting from page 1
+func (p *AvitoParser) ParseAllPages() error {
+	log.Println("Starting full parsing cycle...")
+	
+	totalNewListings := 0
+	totalPages := 0
+	currentPage := 1
+	
+	for {
+		pageURL := p.generatePageURL(currentPage)
+		log.Printf("Processing page %d...", currentPage)
+		
+		// Check if page has enough listings
+		hasListings, listingCount, err := p.hasListings(pageURL)
+		if err != nil {
+			log.Printf("Error checking page %d: %v, skipping...", currentPage, err)
+			currentPage++
+			if currentPage > 10 { // Safety limit
+				break
+			}
+			continue
+		}
+		
+		if !hasListings {
+			log.Printf("Found %d listings on page %d (less than minimum 3), ending pagination", listingCount, currentPage)
+			break
+		}
+		
+		// Parse the page
+		listings, err := p.ParseListings(pageURL)
+		if err != nil {
+			log.Printf("Error parsing page %d: %v, skipping...", currentPage, err)
+			currentPage++
+			continue
+		}
+		
+		// Save listings
+		newListingsCount := 0
+		for _, listing := range listings {
+			err := p.SaveListing(listing)
+			if err != nil {
+				log.Printf("Error saving listing: %v", err)
+			} else {
+				// Check if it was actually saved (not a duplicate)
+				if !strings.Contains(err.Error(), "already exists") {
+					newListingsCount++
+				}
+			}
+		}
+		
+		log.Printf("Found %d listings on page %d, saved %d new listings", len(listings), currentPage, newListingsCount)
+		totalNewListings += newListingsCount
+		totalPages++
+		
+		// Delay before next page
+		if p.pageDelay > 0 {
+			time.Sleep(p.pageDelay)
+		}
+		
+		currentPage++
+		
+		// Safety limit to prevent infinite loops
+		if currentPage > 50 {
+			log.Println("Reached maximum page limit (50), ending pagination")
+			break
+		}
+	}
+	
+	log.Printf("Total cycle results: %d pages processed, %d new listings saved", totalPages, totalNewListings)
+	return nil
+}
+
+// StartContinuousParsing starts continuous parsing with cycles
+func (p *AvitoParser) StartContinuousParsing() {
+	for {
+		err := p.ParseAllPages()
+		if err != nil {
+			log.Printf("Error during parsing cycle: %v", err)
+		}
+		
+		log.Printf("Waiting %v before next cycle...", p.cycleDelay)
+		time.Sleep(p.cycleDelay)
+	}
 }
 
 // ParseListings parses apartment listings from the given URL
@@ -126,7 +271,6 @@ func (p *AvitoParser) ParseListings(url string) ([]*models.Listing, error) {
 		}
 	}
 
-	log.Printf("Successfully parsed %d listings", len(listings))
 	return listings, nil
 }
 
@@ -216,8 +360,8 @@ func (p *AvitoParser) SaveListing(listing *models.Listing) error {
 	}
 
 	if exists {
-		log.Printf("Listing %s already exists, skipping", listing.ID)
-		return nil
+		// Don't log for existing listings to reduce noise
+		return fmt.Errorf("listing already exists")
 	}
 
 	// Convert to JSON
